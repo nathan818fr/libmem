@@ -1,0 +1,102 @@
+---
+
+name: Release
+
+on:
+  push:
+    tags:
+      - '*'
+  workflow_dispatch:
+    inputs:
+      checkout-branch:
+        description: 'The branch or tag to checkout (same as workflow if not specified)'
+        required: false
+      platforms:
+        description: 'The platforms to build (regex, all if not specified)'
+        required: false
+
+jobs:
+
+  prepare:
+    runs-on: ubuntu-latest
+    outputs:
+      artifact-version: ${{ steps.set-version.outputs.artifact-version }}
+      release: ${{ steps.set-version.outputs.release }}
+      matrix: ${{ steps.set-matrix.outputs.matrix }}
+    steps:
+      - name: Set version
+        id: set-version
+        run: |
+          if [[ "$GITHUB_EVENT_NAME" == 'push' && "$GITHUB_REF_TYPE" == 'tag' ]]; then
+            artifact_version=${GITHUB_REF_NAME}
+            release=true
+          else
+            artifact_version='test'
+            release=false
+          fi
+          printf 'Artifact version: %s\n' "$artifact_version"
+          printf 'artifact-version=%s\n' "$artifact_version" >> "$GITHUB_OUTPUT"
+          printf 'Release: %s\n' "$release"
+          printf 'release=%s\n' "$release" >> "$GITHUB_OUTPUT"
+      - name: Set matrix
+        id: set-matrix
+        run: |
+          matrix=$(jq -Mcs \
+            --arg filter "^${INPUT_PLATFORMS:-.*}$" \
+            '{include: [.[] | select(.platform|test($filter))]}' \
+            <<<'
+              {"platform": "linux-gnu-x86_64", "os": "ubuntu-latest"}
+              {"platform": "linux-musl-x86_64", "os": "ubuntu-latest"}
+              {"platform": "windows-msvc-i686", "os": "windows-2019"}
+              {"platform": "windows-msvc-x86_64", "os": "windows-2019"}
+              {"platform": "windows-msvc-aarch64", "os": "windows-2022"}
+              '
+          )
+          printf 'Matrix: %s\n' "$(jq <<< "$matrix")"
+          printf 'matrix=%s\n' "$matrix" >> "$GITHUB_OUTPUT"
+        env:
+          INPUT_PLATFORMS: ${{ inputs.platforms }}
+
+  build:
+    needs: prepare
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJson(needs.prepare.outputs.matrix) }}
+    runs-on: ${{ matrix.os }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.checkout-branch }}
+          submodules: true
+      - name: Build
+        run: ./tools/build-release.sh "$BUILD_PLATFORM"
+        shell: bash
+        env:
+          BUILD_PLATFORM: ${{ matrix.platform }}
+          LIBMEM_BUILD_OUT_DIR: out/libmem-${{ needs.prepare.outputs.artifact-version }}-${{ matrix.platform }}
+          MSYS: 'winsymlinks:sys' # fix symlink issues when cloning on Windows
+      - name: Upload artifact
+        uses: actions/upload-artifact@v3
+        with:
+          name: libmem-${{ needs.prepare.outputs.artifact-version }}-${{ matrix.platform }}
+          path: out/libmem-${{ needs.prepare.outputs.artifact-version }}-${{ matrix.platform }}.tar.gz
+
+  release:
+    needs: [prepare, build]
+    if: needs.prepare.outputs.release == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write # allows the action to create a release
+    steps:
+      - name: Download artifacts
+        uses: actions/download-artifact@v3
+      - name: Create release
+        uses: ncipollo/release-action@v1
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          omitBody: true
+          prerelease: true
+          artifacts: libmem-*/libmem-*.tar.gz
+          artifactContentType: application/gzip
+          artifactErrorsFailBuild: true
